@@ -13,6 +13,11 @@ const userClient = new TwitterApi({
   appSecret: process.env.TWITTER_API_SECRET,
   accessToken: process.env.TWITTER_ACCESS_TOKEN,
   accessSecret: process.env.TWITTER_ACCESS_SECRET,
+}, {
+  retry: true, // Enable retries
+  retryLimit: 3, // Retry 3 times
+  handlerTimeout: 30000, // 30 second timeout
+  requestTimeout: 30000 // 30 second timeout
 });
 
 // Create a list to store recent logs
@@ -84,12 +89,12 @@ app.get('/health', (req, res) => {
 const processedTweets = new Set();
 let nextCheckTime = Date.now();
 
-// Add rate limit handling
+// Update rate limit constants
 const RATE_LIMITS = {
-  minInterval: 60000, // 1 minute minimum
-  maxInterval: 900000, // 15 minutes maximum
-  currentInterval: 60000,
-  backoffFactor: 1.5
+  minInterval: 15000,    // Check every 15 seconds (was 60000)
+  maxInterval: 300000,   // Max 5 minutes when rate limited (was 15 minutes)
+  currentInterval: 15000, // Start with 15 seconds
+  backoffFactor: 2       // Double the interval when rate limited (was 1.5)
 };
 
 function adjustPollingInterval(isRateLimited) {
@@ -114,85 +119,60 @@ function adjustPollingInterval(isRateLimited) {
 
 async function checkMentions() {
   try {
-    if (Date.now() < nextCheckTime) {
-      const waitTime = nextCheckTime - Date.now();
-      log('rate-limit', `Waiting for rate limit`, {
-        nextCheck: new Date(nextCheckTime).toLocaleTimeString(),
-        waitTimeSeconds: Math.round(waitTime / 1000)
-      });
-      setTimeout(checkMentions, waitTime);
+    log('info', 'Starting mentions check...', {
+      userId: process.env.TWITTER_USER_ID,
+      timestamp: new Date().toISOString()
+    });
+
+    const mentions = await userClient.v2.search('"@GenerateWhop"', {
+      max_results: 25,
+      'tweet.fields': ['referenced_tweets', 'author_id', 'text', 'created_at', 'conversation_id'],
+      expansions: ['referenced_tweets.id', 'author_id', 'in_reply_to_user_id']
+    });
+
+    if (!mentions.data || mentions.data.length === 0) {
+      log('info', 'No mentions found');
       return;
     }
 
-    log('info', 'Checking for new mentions...');
-    
-    const mentions = await userClient.v2.userMentionTimeline(process.env.TWITTER_USER_ID, {
-      max_results: 5,
-      'tweet.fields': ['referenced_tweets', 'author_id', 'text']
-    });
-
-    // Handle rate limits
-    if (mentions.rateLimit) {
-      const resetTime = mentions.rateLimit.reset * 1000;
-      if (mentions.rateLimit.remaining < 2) { // Buffer of 1
-        nextCheckTime = resetTime;
-        adjustPollingInterval(true);
-      } else {
-        adjustPollingInterval(false);
-      }
-      
-      log('rate-limit', 'Rate limit info', {
-        remaining: mentions.rateLimit.remaining,
-        limit: mentions.rateLimit.limit,
-        resetsAt: new Date(resetTime).toLocaleTimeString(),
-        currentInterval: Math.round(RATE_LIMITS.currentInterval / 1000) + 's'
-      });
-    }
-
-    if (!mentions.data) {
-      log('info', 'No new mentions found');
-    } else {
-      log('info', `Found mentions to process`, {
-        count: mentions.data.length,
-        tweets: mentions.data.map(t => ({ id: t.id, text: t.text }))
-      });
-
-      for (const tweet of mentions.data) {
-        try {
-          if (processedTweets.has(tweet.id)) {
-            log('skip', `Already processed tweet`, { id: tweet.id });
-            continue;
-          }
-          
-          if (tweet.referenced_tweets?.some(ref => ref.type === 'retweeted')) {
-            log('skip', `Skipping retweet`, { id: tweet.id });
-            continue;
-          }
-
-          log('process', 'Processing new mention', {
-            id: tweet.id,
-            text: tweet.text,
-            author: tweet.author_id
-          });
-          
-          const result = await handleWhopGeneration(tweet, false, userClient, log);
-          processedTweets.add(tweet.id);
-          
-          log('success', `Successfully processed tweet`, {
-            id: tweet.id,
-            store: result.store
-          });
-        } catch (error) {
-          log('error', `Error processing tweet`, {
-            id: tweet.id,
-            error: error.message,
-            stack: error.stack
-          });
+    // Process each mention
+    for (const tweet of mentions.data) {
+      try {
+        if (processedTweets.has(tweet.id)) {
+          log('skip', `Already processed tweet`, { id: tweet.id });
+          continue;
         }
+
+        // Skip retweets
+        if (tweet.referenced_tweets?.some(ref => ref.type === 'retweeted')) {
+          log('skip', `Skipping retweet`, { id: tweet.id });
+          continue;
+        }
+
+        log('process', 'Processing Whop mention', {
+          id: tweet.id,
+          text: tweet.text,
+          author: tweet.author_id
+        });
+        
+        const result = await handleWhopGeneration(tweet, false, userClient, log);
+        processedTweets.add(tweet.id);
+        
+        log('success', `Successfully processed tweet`, {
+          id: tweet.id,
+          store: result.store
+        });
+      } catch (error) {
+        log('error', `Error processing tweet`, {
+          id: tweet.id,
+          error: error.message,
+          stack: error.stack
+        });
       }
     }
+
   } catch (error) {
-    if (error.code === 429) {
+    if (error.code === 429) { // Rate limit error
       const resetTime = error.rateLimit?.reset * 1000 || Date.now() + RATE_LIMITS.currentInterval;
       nextCheckTime = resetTime;
       adjustPollingInterval(true);
@@ -208,7 +188,6 @@ async function checkMentions() {
       });
     }
   } finally {
-    // Use our dynamic interval
     const waitTime = Math.max(RATE_LIMITS.currentInterval, nextCheckTime - Date.now());
     log('info', `Scheduling next check`, {
       inSeconds: Math.round(waitTime/1000),
@@ -218,8 +197,50 @@ async function checkMentions() {
   }
 }
 
-// Start both the server and the bot
-app.listen(port, () => {
+// Add at the top of the file after client initialization
+async function verifyTwitterCredentials() {
+  try {
+    const me = await userClient.v2.me();
+    log('info', 'Twitter credentials verified', {
+      id: me.data.id,
+      username: me.data.username,
+      name: me.data.name
+    });
+    
+    // Verify it matches our env variable
+    if (me.data.id !== process.env.TWITTER_USER_ID) {
+      log('error', 'Twitter user ID mismatch', {
+        envUserId: process.env.TWITTER_USER_ID,
+        actualUserId: me.data.id
+      });
+    }
+  } catch (error) {
+    log('error', 'Failed to verify Twitter credentials', {
+      error: error.message
+    });
+    throw error;
+  }
+}
+
+// Add test endpoint
+app.get('/test/mentions', async (req, res) => {
+  try {
+    log('info', 'Manual mentions check triggered');
+    await checkMentions();
+    res.json({ status: 'ok', logs: recentLogs });
+  } catch (error) {
+    log('error', 'Manual check failed', { error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update the server startup
+app.listen(port, async () => {
   console.log(`Server running at http://localhost:${port}`);
-  checkMentions().catch(console.error);
+  try {
+    await verifyTwitterCredentials();
+    await checkMentions();
+  } catch (error) {
+    console.error('Failed to start bot:', error);
+  }
 }); 

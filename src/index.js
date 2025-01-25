@@ -23,18 +23,56 @@ const openai = new OpenAI({
 
 // Oh lord, here we go - the main bot logic that'll probably break
 async function handleWhopGeneration(tweet, testMode = false, twitterClient = null, log) {
-  const prompt = tweet.text.replace('@GenerateWhop', '').trim();
-  
+  const tweetText = tweet.text
+    .replace(/@\S+/g, '')
+    .replace(/https?:\/\/\S+/g, '')
+    .trim();
+
+  log('process', 'Processing tweet text', { 
+    original: tweet.text,
+    cleaned: tweetText
+  });
+
+  if (!tweetText) {
+    log('error', 'No instructions found in tweet', { tweet: tweet.text });
+    if (!testMode && twitterClient) {
+      await twitterClient.v2.reply(
+        `😅 Please include instructions for what kind of store you want to create!`,
+        tweet.id
+      );
+    }
+    return;
+  }
+
   try {
-    log('process', 'Generating store details with GPT-4...', { tweet: tweet.text });
+    log('process', 'Generating store details with GPT-4...', { prompt: tweetText });
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
       messages: [{
         role: "system",
-        content: "Generate a JSON object for a Whop store with these fields: name (string), description (string), boldClaim (string). Make it relevant to the prompt."
+        content: `You are a Whop store creation expert. Generate a detailed JSON object for a store with these fields:
+          - name: Catchy, memorable store name
+          - description: Detailed 3-paragraph description highlighting value props
+          - boldClaim: Bold marketing statement (1 line)
+          - features: Array of 4-6 key features
+          - pricing: {
+              basic: { name, price, features },
+              pro: { name, price, features },
+              enterprise: { name, price, features }
+            }
+          - category: Main store category
+          - tags: Array of relevant tags
+          - faqs: Array of { question, answer }
+          - socialLinks: { discord, twitter, telegram }
+          - customization: {
+              primaryColor: hex color code,
+              style: modern/minimal/bold
+            }
+          
+          Make it compelling and specific to: "${tweetText}"`
       }, {
         role: "user",
-        content: prompt
+        content: tweetText
       }]
     });
 
@@ -42,8 +80,13 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     log('info', 'Generated store details', { storeDetails });
     
     log('process', 'Generating logo with DALL-E...');
+    const logoPrompt = `Professional ${storeDetails.customization.style} logo for ${storeDetails.name}. 
+      ${storeDetails.category} themed, ${storeDetails.customization.style} design, 
+      primary color: ${storeDetails.customization.primaryColor}. 
+      Dark theme compatible, minimalist, suitable for web3.`;
+    
     const logoResponse = await openai.images.generate({
-      prompt: `Professional minimalist logo for ${storeDetails.name}, business icon`,
+      prompt: logoPrompt,
       n: 1,
       size: '1024x1024'
     });
@@ -57,25 +100,41 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
       logo_url: logoResponse.data[0].url,
       type: "community",
       visibility: "public",
-      _rsc: "1",
-      _method: "POST"
+      primary_color: storeDetails.customization.primaryColor,
+      apps: [
+        {
+          type: "chat",
+          enabled: true,
+          settings: {
+            name: "Community Chat",
+            description: "Join our vibrant community discussion"
+          }
+        },
+        {
+          type: "discord",
+          enabled: true,
+          settings: {
+            name: "Discord Community",
+            description: "Connect with members on Discord",
+            url: storeDetails.socialLinks.discord
+          }
+        }
+      ],
+      memberships: Object.entries(storeDetails.pricing).map(([tier, details]) => ({
+        name: details.name,
+        price: details.price,
+        billing_period: "monthly",
+        features: details.features,
+        visibility: "public"
+      })),
+      faqs: storeDetails.faqs,
+      social_links: storeDetails.socialLinks,
+      tags: storeDetails.tags
     }, {
       headers: {
-        'Accept': '*/*',
-        'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.WHOP_API_KEY}`,
-        'Origin': 'https://whop.com',
-        'Referer': 'https://whop.com/onboarding',
-        'X-Frame-Options': 'SAMEORIGIN',
-        'Next-Router-State-Tree': 'true',
-        'Next-Router-Prefetch': 'true',
-        'RSC': '1',
-        'X-Vercel-Cache': 'MISS'
-      },
-      maxRedirects: 5, // Allow some redirects for live mode
-      withCredentials: true,
-      validateStatus: function (status) {
-        return status >= 200 && status < 400; // Only accept success codes
+        'Content-Type': 'application/json',
+        'Origin': 'https://whop.com'
       }
     });
 
@@ -86,11 +145,23 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     log('success', 'Created Whop store', { url: storeUrl });
 
     if (!testMode && twitterClient) {
+      const reply = `✨ Created your Whop store for ${storeDetails.name}!
+
+🌐 Store: ${storeUrl}
+💫 ${storeDetails.boldClaim}
+
+Includes:
+${storeDetails.features.map(f => `• ${f}`).join('\n')}
+
+Pricing:
+${Object.entries(storeDetails.pricing).map(([tier, details]) => 
+  `• ${details.name}: $${details.price}/mo`
+).join('\n')}
+
+Check it out and let me know if you need any changes!`;
+
       log('process', 'Replying to tweet...');
-      await twitterClient.v2.reply(
-        `✨ Created your Whop store! Check it out: ${storeUrl}`,
-        tweet.id
-      );
+      await twitterClient.v2.reply(reply, tweet.id);
       log('success', 'Replied to tweet');
     }
 
@@ -99,7 +170,7 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
       store: {
         name: storeDetails.name,
         url: storeUrl,
-        response: whopResponse.data
+        details: storeDetails
       },
       tweet: testMode ? null : tweet
     };
