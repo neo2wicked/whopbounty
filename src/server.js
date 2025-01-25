@@ -117,93 +117,110 @@ function adjustPollingInterval(isRateLimited) {
   return RATE_LIMITS.currentInterval;
 }
 
+// Add error handling middleware
+app.use((err, req, res, next) => {
+  log('error', 'Express error handler', {
+    error: err.message,
+    stack: err.stack
+  });
+  res.status(500).json({ error: err.message });
+});
+
 async function checkMentions() {
   try {
-    log('info', 'Starting mentions check...', {
-      userId: process.env.TWITTER_USER_ID,
-      timestamp: new Date().toISOString()
-    });
+    log('info', 'Starting mentions check...');
 
-    // Get mentions using search
     const mentions = await userClient.v2.search('"@GenerateWhop"', {
       max_results: 25,
       'tweet.fields': ['referenced_tweets', 'author_id', 'text', 'created_at', 'conversation_id'],
       expansions: ['referenced_tweets.id', 'author_id', 'in_reply_to_user_id']
     });
 
-    // Add debug logging to see what we're getting
+    // Debug log the raw response
     log('debug', 'Raw Twitter response', {
-      data: mentions?.data,
-      meta: mentions?.meta,
-      errors: mentions?.errors
+      hasData: !!mentions?.data,
+      dataLength: mentions?.data?.length,
+      firstTweet: mentions?.data?.[0],
+      meta: mentions?.meta
     });
 
-    // Safer data handling
-    if (!mentions?.data) {
-      log('info', 'No mentions found or invalid response', {
-        hasData: !!mentions?.data,
-        errors: mentions?.errors
-      });
+    if (!mentions?.data?.length) {
+      log('info', 'No mentions found');
       return;
     }
 
-    // Convert to array if it's not already
-    const mentionsArray = Array.isArray(mentions.data) ? mentions.data : [mentions.data];
-    
-    log('info', `Found ${mentionsArray.length} mentions`);
-
-    // Process each mention
-    for (const tweet of mentionsArray) {
+    // Process each mention with better error handling
+    for (const tweet of mentions.data) {
       try {
+        // Validate tweet object
+        if (!tweet?.id || !tweet?.text) {
+          log('error', 'Invalid tweet object', { tweet });
+          continue;
+        }
+
+        // Skip if already processed
         if (processedTweets.has(tweet.id)) {
-          log('skip', `Already processed tweet`, { id: tweet.id });
+          log('skip', `Already processed tweet ${tweet.id}`);
+          continue;
+        }
+
+        // Skip retweets and replies to other tweets
+        if (tweet.referenced_tweets?.some(ref => ref.type === 'retweeted')) {
+          log('skip', `Skipping retweet ${tweet.id}`);
           continue;
         }
 
         log('process', 'Processing tweet', {
           id: tweet.id,
           text: tweet.text,
-          author: tweet.author_id
+          author: tweet.author_id,
+          created_at: tweet.created_at
         });
 
-        const result = await handleWhopGeneration(tweet, false, userClient, log);
-        processedTweets.add(tweet.id);
+        // Process the tweet
+        const result = await handleWhopGeneration(
+          {
+            id: tweet.id,
+            text: tweet.text,
+            author_id: tweet.author_id,
+            created_at: tweet.created_at
+          },
+          false,
+          userClient,
+          log
+        );
 
-        log('success', `Successfully processed tweet`, {
-          id: tweet.id,
-          store: result.store
-        });
+        // Mark as processed if successful
+        if (result?.status === 'success') {
+          processedTweets.add(tweet.id);
+          log('success', `Successfully processed tweet ${tweet.id}`, {
+            store: result.store
+          });
+        }
+
       } catch (error) {
-        log('error', `Error processing tweet`, {
-          id: tweet.id,
+        log('error', `Error processing tweet ${tweet?.id}`, {
           error: error.message,
-          stack: error.stack
+          stack: error.stack,
+          tweet: {
+            id: tweet?.id,
+            text: tweet?.text
+          }
         });
+        // Continue processing other tweets even if one fails
+        continue;
       }
     }
 
   } catch (error) {
-    if (error.code === 429) { // Rate limit error
-      const resetTime = error.rateLimit?.reset * 1000 || Date.now() + RATE_LIMITS.currentInterval;
-      nextCheckTime = resetTime;
-      adjustPollingInterval(true);
-      
-      log('rate-limit', `Rate limited`, {
-        resetsAt: new Date(resetTime).toLocaleTimeString(),
-        newInterval: Math.round(RATE_LIMITS.currentInterval / 1000) + 's'
-      });
-    } else {
-      log('error', 'Failed to check mentions', {
-        error: error.message,
-        stack: error.stack
-      });
-    }
-  } finally {
-    const waitTime = Math.max(RATE_LIMITS.currentInterval, nextCheckTime - Date.now());
-    log('info', `Scheduling next check`, {
-      inSeconds: Math.round(waitTime/1000),
-      currentInterval: Math.round(RATE_LIMITS.currentInterval/1000) + 's'
+    log('error', 'Failed to check mentions', {
+      error: error.message,
+      stack: error.stack
     });
+  } finally {
+    // Schedule next check
+    const waitTime = Math.max(RATE_LIMITS.currentInterval, nextCheckTime - Date.now());
+    log('info', `Scheduling next check in ${Math.round(waitTime/1000)}s`);
     setTimeout(checkMentions, waitTime);
   }
 }

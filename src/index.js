@@ -18,34 +18,58 @@ const twitterClient = new TwitterApi({
 
 // New OpenAI client because you can't be bothered to read the docs
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
+  dangerouslyAllowBrowser: false
 });
+
+// Add error handling for missing API keys
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error('Missing OPENAI_API_KEY in environment variables');
+}
+
+if (!process.env.WHOP_API_KEY) {
+  throw new Error('Missing WHOP_API_KEY in environment variables');
+}
 
 // Oh lord, here we go - the main bot logic that'll probably break
 async function handleWhopGeneration(tweet, testMode = false, twitterClient = null, log) {
-  const tweetText = tweet.text
-    .replace(/@\S+/g, '')
-    .replace(/https?:\/\/\S+/g, '')
-    .trim();
-
-  log('process', 'Processing tweet text', { 
-    original: tweet.text,
-    cleaned: tweetText
-  });
-
-  if (!tweetText) {
-    log('error', 'No instructions found in tweet', { tweet: tweet.text });
-    if (!testMode && twitterClient) {
-      await twitterClient.v2.reply(
-        `😅 Please include instructions for what kind of store you want to create!`,
-        tweet.id
-      );
-    }
-    return;
-  }
-
   try {
-    log('process', 'Generating store details with GPT-4...', { prompt: tweetText });
+    // Add validation for required tweet fields
+    if (!tweet?.id || !tweet?.text) {
+      throw new Error('Invalid tweet object received');
+    }
+
+    log('debug', 'Starting store generation', {
+      tweet: {
+        id: tweet.id,
+        text: tweet.text,
+        author: tweet.author_id
+      }
+    });
+
+    const tweetText = tweet.text
+      .replace(/@\S+/g, '')
+      .replace(/https?:\/\/\S+/g, '')
+      .trim();
+
+    log('debug', 'Cleaned tweet text', {
+      original: tweet.text,
+      cleaned: tweetText
+    });
+
+    if (!tweetText) {
+      log('error', 'No instructions found in tweet', { tweet: tweet.text });
+      if (!testMode && twitterClient) {
+        await twitterClient.v2.reply(
+          `😅 Please include instructions for what kind of store you want to create!`,
+          tweet.id
+        );
+      }
+      return;
+    }
+
+    // Step 1: Generate store details
+    log('debug', 'Calling GPT-4...');
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
       messages: [{
@@ -74,12 +98,19 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
         role: "user",
         content: tweetText
       }]
+    }).catch(error => {
+      log('error', 'GPT-4 API error', {
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
     });
 
     const storeDetails = JSON.parse(completion.choices[0].message.content);
-    log('info', 'Generated store details', { storeDetails });
+    log('debug', 'Generated store details', { storeDetails });
     
-    log('process', 'Generating logo with DALL-E...');
+    // Step 2: Generate logo
+    log('debug', 'Generating logo...');
     const logoPrompt = `Professional ${storeDetails.customization.style} logo for ${storeDetails.name}. 
       ${storeDetails.category} themed, ${storeDetails.customization.style} design, 
       primary color: ${storeDetails.customization.primaryColor}. 
@@ -89,10 +120,17 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
       prompt: logoPrompt,
       n: 1,
       size: '1024x1024'
+    }).catch(error => {
+      log('error', 'DALL-E API error', {
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
     });
     log('info', 'Generated logo', { url: logoResponse.data[0].url });
 
-    log('process', 'Creating Whop store...');
+    // Step 3: Create Whop store
+    log('debug', 'Creating Whop store...');
     const whopResponse = await axios.post('https://whop.com/api/onboarding/create-company', {
       name: storeDetails.name,
       description: storeDetails.description,
@@ -136,6 +174,13 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
         'Content-Type': 'application/json',
         'Origin': 'https://whop.com'
       }
+    }).catch(error => {
+      log('error', 'Whop API error', {
+        error: error.message,
+        response: error.response?.data,
+        stack: error.stack
+      });
+      throw error;
     });
 
     const storeUrl = whopResponse.headers?.location || 
@@ -144,6 +189,7 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     
     log('success', 'Created Whop store', { url: storeUrl });
 
+    // Step 4: Reply to tweet
     if (!testMode && twitterClient) {
       try {
         log('debug', 'Twitter client check', { 
@@ -153,15 +199,15 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
         });
 
         const reply = `✨ Created your Whop store for ${storeDetails.name}!...`;
+        log('debug', 'Sending tweet reply', { reply });
         
-        try {
-          await twitterClient.v2.reply(reply, tweet.id);
-        } catch (e) {
-          log('error', 'V2 reply failed, trying V1', { error: e.message });
-          await twitterClient.v1.tweet(reply, { 
-            in_reply_to_status_id: tweet.id 
+        await twitterClient.v2.reply(reply, tweet.id)
+          .catch(async (e) => {
+            log('error', 'V2 reply failed, trying V1', { error: e.message });
+            await twitterClient.v1.tweet(reply, { 
+              in_reply_to_status_id: tweet.id 
+            });
           });
-        }
         
         log('success', 'Replied to tweet');
       } catch (error) {
@@ -184,9 +230,13 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     };
 
   } catch (error) {
-    log('error', 'Failed to generate store', {
+    log('error', 'Store generation failed', {
       error: error.message,
-      stack: error.stack
+      stack: error.stack,
+      tweet: {
+        id: tweet.id,
+        text: tweet.text
+      }
     });
     throw error;
   }
