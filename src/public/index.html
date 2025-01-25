@@ -1,94 +1,21 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>WhopBot Dashboard</title>
-  <style>
-    body {
-      font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      margin: 0;
-      padding: 20px;
-      background: #f5f5f5;
-    }
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
-    }
-    .status {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .logs {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      height: 600px;
-      overflow-y: auto;
-    }
-    .log-entry {
-      padding: 10px;
-      border-bottom: 1px solid #eee;
-      font-family: monospace;
-    }
-    .log-entry:hover {
-      background: #f8f8f8;
-    }
-    .type-error { color: #dc3545; }
-    .type-success { color: #28a745; }
-    .type-info { color: #17a2b8; }
-    .type-rate-limit { color: #ffc107; }
-    .type-process { color: #6610f2; }
-    .type-skip { color: #6c757d; }
-  </style>
+  <title>Bot Status</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="container">
-    <div class="status" id="status">
-      <h2>Bot Status</h2>
-      <div id="statusContent"></div>
+    <div class="status-card">
+      <h1>Bot Status</h1>
+      <div id="status"></div>
     </div>
-    <div class="logs">
+
+    <div class="logs-card">
       <h2>Live Logs</h2>
-      <div id="logContent"></div>
+      <div id="logs"></div>
     </div>
   </div>
-
-  <script>
-    // Connect to SSE endpoint
-    const evtSource = new EventSource('/logs/stream');
-    const logContent = document.getElementById('logContent');
-    const statusContent = document.getElementById('statusContent');
-
-    // Update status every 5 seconds
-    async function updateStatus() {
-      const response = await fetch('/status');
-      const status = await response.json();
-      statusContent.innerHTML = `
-        <p>Uptime: ${Math.floor(status.uptime / 60)} minutes</p>
-        <p>Processed Tweets: ${status.processedTweets}</p>
-        <p>Next Check: ${new Date(status.nextCheck).toLocaleString()}</p>
-        <p>Current Interval: ${status.currentInterval / 1000}s</p>
-      `;
-    }
-    setInterval(updateStatus, 5000);
-    updateStatus();
-
-    // Handle incoming logs
-    evtSource.onmessage = function(event) {
-      const log = JSON.parse(event.data);
-      const div = document.createElement('div');
-      div.className = `log-entry type-${log.type}`;
-      div.innerHTML = `
-        <span>${new Date(log.timestamp).toLocaleString()}</span>
-        <strong>[${log.type}]</strong>
-        ${log.message}
-        ${log.data ? `<pre>${JSON.stringify(log.data, null, 2)}</pre>` : ''}
-      `;
-      logContent.insertBefore(div, logContent.firstChild);
-    };
-  </script>
+  <script src="script.js"></script>
 </body>
 </html> 

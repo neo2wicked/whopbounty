@@ -57,7 +57,7 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
       cleaned: tweetText
     });
 
-    if (!tweetText) {
+    if (tweet.text.startsWith('@whoptestbot') && !tweet.referenced_tweets) {
       log('error', 'No instructions found in tweet', { tweet: tweet.text });
       if (!testMode && twitterClient) {
         await twitterClient.v2.reply(

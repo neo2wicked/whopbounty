@@ -22,12 +22,12 @@ const clients = new Set();
 
 // Update the rate limit constants
 const RATE_LIMITS = {
-  currentInterval: 60000,
-  maxInterval: 900000,
+  currentInterval: 900000,  // Start at 15 minutes instead of 5
+  maxInterval: 900000,      // Max 15 minutes
   resetTime: null,
   lastSearchTime: null,
   startupRetries: 0,
-  maxStartupRetries: 5
+  maxStartupRetries: 3      // Reduced retries to avoid hitting limits
 };
 
 // Modify the log function to broadcast to clients
@@ -80,6 +80,9 @@ const processedTweets = new Set();
 // Add startup retry function
 async function verifyCredentialsWithRetry() {
   try {
+    // Add initial delay before first attempt
+    await new Promise(resolve => setTimeout(resolve, 30000)); // 30 second initial delay
+    
     const me = await userClient.v2.me();
     log('info', 'Twitter credentials verified', {
       id: me.data.id,
@@ -91,14 +94,12 @@ async function verifyCredentialsWithRetry() {
       RATE_LIMITS.startupRetries++;
       const resetTime = error.rateLimit?.reset 
         ? error.rateLimit.reset * 1000 
-        : Date.now() + 300000;
+        : Date.now() + 900000; // 15 minute default
 
-      const waitTime = Math.max(resetTime - Date.now(), 60000);
-      const minutes = Math.floor(waitTime / 60000);
-      const seconds = Math.floor((waitTime % 60000) / 1000);
+      const waitTime = Math.max(resetTime - Date.now(), 300000); // At least 5 minutes
       
       log('rate-limit', `Startup rate limited, retry ${RATE_LIMITS.startupRetries}/${RATE_LIMITS.maxStartupRetries}`, {
-        waitTime: `${minutes}m ${seconds}s`,
+        waitTime: `${Math.floor(waitTime/60000)}m ${Math.floor((waitTime%60000)/1000)}s`,
         exactMs: waitTime,
         resetsAt: new Date(resetTime).toLocaleTimeString(),
         nextTryAt: new Date(Date.now() + waitTime).toLocaleTimeString()
@@ -142,75 +143,48 @@ async function checkMentions() {
   try {
     log('info', 'Starting mentions check...');
 
-    // Add minimum time between searches
-    const timeSinceLastSearch = RATE_LIMITS.lastSearchTime 
-      ? Date.now() - RATE_LIMITS.lastSearchTime 
-      : Infinity;
-    
-    if (timeSinceLastSearch < 60000) { // Minimum 60s between searches
-      log('info', 'Too soon to search again', {
-        waitFor: Math.round((60000 - timeSinceLastSearch)/1000) + 's'
-      });
+    // Match their fetch notifications approach
+    const mentions = await userClient.v2.search('@whoptestbot a Whop for my', {
+      max_results: 3,
+      'tweet.fields': ['referenced_tweets', 'author_id', 'text', 'created_at'],
+      expansions: ['referenced_tweets.id', 'author_id']
+    });
+
+    if (!mentions?.data?.length) {
+      log('info', 'No mentions found');
       return;
     }
 
-    // Check rate limit cooldown
-    if (RATE_LIMITS.resetTime && Date.now() < RATE_LIMITS.resetTime) {
-      log('info', 'Waiting for rate limit reset', {
-        resetsIn: Math.round((RATE_LIMITS.resetTime - Date.now()) / 1000) + 's'
-      });
-      return;
-    }
+    log('info', `Found ${mentions.data.length} mentions`);
 
-    // Skip the test call and go straight to search
-    try {
-      const mentions = await userClient.v2.search('"@GenerateWhop"', {
-        max_results: 5, // Reduced further to be extra gentle
-        'tweet.fields': ['referenced_tweets', 'author_id', 'text', 'created_at'],
-        expansions: ['referenced_tweets.id', 'author_id']
-      });
+    for (const tweet of mentions.data) {
+      try {
+        if (processedTweets.has(tweet.id)) {
+          continue;
+        }
 
-      // Update last search time
-      RATE_LIMITS.lastSearchTime = Date.now();
-
-      if (!mentions?.data?.length) {
-        log('info', 'No mentions found');
-        return;
-      }
-
-      log('info', `Found ${mentions.data.length} mentions`);
-
-      for (const tweet of mentions.data) {
-        try {
-          if (processedTweets.has(tweet.id)) {
-            continue;
-          }
-
+        // Match their regex pattern
+        const match = tweet.text.match(/@whoptestbot a Whop for my (.+)/i);
+        if (match) {
+          const businessName = match[1];
           log('process', 'Processing tweet', {
             id: tweet.id,
-            text: tweet.text
+            text: tweet.text,
+            businessName
           });
 
           const result = await handleWhopGeneration(tweet, false, userClient, log);
-          
           if (result?.status === 'success') {
             processedTweets.add(tweet.id);
           }
-
-        } catch (error) {
-          log('error', 'Error processing tweet', {
-            error: error.message,
-            id: tweet.id
-          });
         }
-      }
 
-    } catch (error) {
-      if (error.code === 429) {
-        handleRateLimit(error);
-        return;
+      } catch (error) {
+        log('error', 'Error processing tweet', {
+          error: error.message,
+          id: tweet.id
+        });
       }
-      throw error;
     }
 
   } catch (error) {
@@ -251,4 +225,16 @@ function handleRateLimit(error) {
     newInterval: Math.round(RATE_LIMITS.currentInterval / 1000) + 's',
     rateLimitInfo: error.rateLimit || 'No rate limit info'
   });
-} 
+}
+
+// Add status endpoint
+app.get('/status', (req, res) => {
+  res.json({
+    uptime: process.uptime(),
+    processedTweets: processedTweets.size,
+    nextCheck: RATE_LIMITS.resetTime 
+      ? new Date(RATE_LIMITS.resetTime).toISOString()
+      : new Date(Date.now() + RATE_LIMITS.currentInterval).toISOString(),
+    currentInterval: Math.round(RATE_LIMITS.currentInterval / 1000) + 's'
+  });
+}); 

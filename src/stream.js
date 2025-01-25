@@ -18,11 +18,11 @@ async function startStream(client) {
     console.log('Received tweet:', tweet.text);  // Debug log
     
     // Check if it's a mention and not a reply to avoid infinite loops
-    if (tweet.text.startsWith('@GenerateWhop') && !tweet.referenced_tweets) {
-      console.log('Processing WhopBot request:', tweet.text);  // Debug log
+    if (tweet.text.startsWith('@whoptestbot') && !tweet.referenced_tweets) {
+      console.log('Processing WhopBot request:', tweet.text);
       try {
         await handleWhopGeneration(tweet);
-        console.log('Successfully processed request!');  // Debug log
+        console.log('Successfully processed request!');
       } catch (error) {
         console.error("You done messed up:", error);
       }
