@@ -145,24 +145,32 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     log('success', 'Created Whop store', { url: storeUrl });
 
     if (!testMode && twitterClient) {
-      const reply = `✨ Created your Whop store for ${storeDetails.name}!
+      try {
+        log('debug', 'Twitter client check', { 
+          hasClient: !!twitterClient,
+          tweetId: tweet.id,
+          authorId: tweet.author_id
+        });
 
-🌐 Store: ${storeUrl}
-💫 ${storeDetails.boldClaim}
-
-Includes:
-${storeDetails.features.map(f => `• ${f}`).join('\n')}
-
-Pricing:
-${Object.entries(storeDetails.pricing).map(([tier, details]) => 
-  `• ${details.name}: $${details.price}/mo`
-).join('\n')}
-
-Check it out and let me know if you need any changes!`;
-
-      log('process', 'Replying to tweet...');
-      await twitterClient.v2.reply(reply, tweet.id);
-      log('success', 'Replied to tweet');
+        const reply = `✨ Created your Whop store for ${storeDetails.name}!...`;
+        
+        try {
+          await twitterClient.v2.reply(reply, tweet.id);
+        } catch (e) {
+          log('error', 'V2 reply failed, trying V1', { error: e.message });
+          await twitterClient.v1.tweet(reply, { 
+            in_reply_to_status_id: tweet.id 
+          });
+        }
+        
+        log('success', 'Replied to tweet');
+      } catch (error) {
+        log('error', 'Failed to reply to tweet', {
+          error: error.message,
+          tweetId: tweet.id,
+          stack: error.stack
+        });
+      }
     }
 
     return {

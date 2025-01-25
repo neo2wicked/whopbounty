@@ -124,40 +124,51 @@ async function checkMentions() {
       timestamp: new Date().toISOString()
     });
 
+    // Get mentions using search
     const mentions = await userClient.v2.search('"@GenerateWhop"', {
       max_results: 25,
       'tweet.fields': ['referenced_tweets', 'author_id', 'text', 'created_at', 'conversation_id'],
       expansions: ['referenced_tweets.id', 'author_id', 'in_reply_to_user_id']
     });
 
-    if (!mentions.data || mentions.data.length === 0) {
-      log('info', 'No mentions found');
+    // Add debug logging to see what we're getting
+    log('debug', 'Raw Twitter response', {
+      data: mentions?.data,
+      meta: mentions?.meta,
+      errors: mentions?.errors
+    });
+
+    // Safer data handling
+    if (!mentions?.data) {
+      log('info', 'No mentions found or invalid response', {
+        hasData: !!mentions?.data,
+        errors: mentions?.errors
+      });
       return;
     }
 
+    // Convert to array if it's not already
+    const mentionsArray = Array.isArray(mentions.data) ? mentions.data : [mentions.data];
+    
+    log('info', `Found ${mentionsArray.length} mentions`);
+
     // Process each mention
-    for (const tweet of mentions.data) {
+    for (const tweet of mentionsArray) {
       try {
         if (processedTweets.has(tweet.id)) {
           log('skip', `Already processed tweet`, { id: tweet.id });
           continue;
         }
 
-        // Skip retweets
-        if (tweet.referenced_tweets?.some(ref => ref.type === 'retweeted')) {
-          log('skip', `Skipping retweet`, { id: tweet.id });
-          continue;
-        }
-
-        log('process', 'Processing Whop mention', {
+        log('process', 'Processing tweet', {
           id: tweet.id,
           text: tweet.text,
           author: tweet.author_id
         });
-        
+
         const result = await handleWhopGeneration(tweet, false, userClient, log);
         processedTweets.add(tweet.id);
-        
+
         log('success', `Successfully processed tweet`, {
           id: tweet.id,
           store: result.store
@@ -197,7 +208,7 @@ async function checkMentions() {
   }
 }
 
-// Add at the top of the file after client initialization
+// Verify credentials on startup
 async function verifyTwitterCredentials() {
   try {
     const me = await userClient.v2.me();
@@ -206,19 +217,13 @@ async function verifyTwitterCredentials() {
       username: me.data.username,
       name: me.data.name
     });
-    
-    // Verify it matches our env variable
-    if (me.data.id !== process.env.TWITTER_USER_ID) {
-      log('error', 'Twitter user ID mismatch', {
-        envUserId: process.env.TWITTER_USER_ID,
-        actualUserId: me.data.id
-      });
-    }
+    return true;
   } catch (error) {
     log('error', 'Failed to verify Twitter credentials', {
-      error: error.message
+      error: error.message,
+      stack: error.stack
     });
-    throw error;
+    return false;
   }
 }
 
