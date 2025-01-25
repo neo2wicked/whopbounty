@@ -20,11 +20,14 @@ const recentLogs = [];
 const MAX_LOGS = 100;
 const clients = new Set();
 
-// Add rate limit tracking at the top with other constants
+// Update the rate limit constants
 const RATE_LIMITS = {
-  currentInterval: 15000,  // Start at 15 seconds
-  maxInterval: 900000,     // Max 15 minutes
-  resetTime: null
+  currentInterval: 60000,
+  maxInterval: 900000,
+  resetTime: null,
+  lastSearchTime: null,
+  startupRetries: 0,
+  maxStartupRetries: 5
 };
 
 // Modify the log function to broadcast to clients
@@ -74,11 +77,84 @@ app.get('/logs/stream', (req, res) => {
 // Keep track of processed tweets
 const processedTweets = new Set();
 
+// Add startup retry function
+async function verifyCredentialsWithRetry() {
+  try {
+    const me = await userClient.v2.me();
+    log('info', 'Twitter credentials verified', {
+      id: me.data.id,
+      username: me.data.username
+    });
+    return true;
+  } catch (error) {
+    if (error.code === 429) {
+      RATE_LIMITS.startupRetries++;
+      const resetTime = error.rateLimit?.reset 
+        ? error.rateLimit.reset * 1000 
+        : Date.now() + 300000;
+
+      const waitTime = Math.max(resetTime - Date.now(), 60000);
+      const minutes = Math.floor(waitTime / 60000);
+      const seconds = Math.floor((waitTime % 60000) / 1000);
+      
+      log('rate-limit', `Startup rate limited, retry ${RATE_LIMITS.startupRetries}/${RATE_LIMITS.maxStartupRetries}`, {
+        waitTime: `${minutes}m ${seconds}s`,
+        exactMs: waitTime,
+        resetsAt: new Date(resetTime).toLocaleTimeString(),
+        nextTryAt: new Date(Date.now() + waitTime).toLocaleTimeString()
+      });
+
+      if (RATE_LIMITS.startupRetries < RATE_LIMITS.maxStartupRetries) {
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        return verifyCredentialsWithRetry();
+      }
+    }
+    return false;
+  }
+}
+
+// Update the server startup
+app.listen(port, async () => {
+  console.log(`Server running at http://localhost:${port}`);
+  
+  try {
+    // Try to verify credentials with retries
+    const verified = await verifyCredentialsWithRetry();
+    
+    if (verified) {
+      // Wait a bit before starting mentions check to avoid rate limits
+      setTimeout(() => {
+        log('info', 'Starting mentions check loop');
+        checkMentions();
+      }, 30000); // 30 second delay
+    } else {
+      log('error', 'Failed to verify Twitter credentials after retries');
+    }
+  } catch (error) {
+    log('error', 'Fatal startup error', {
+      error: error.message,
+      stack: error.stack
+    });
+  }
+});
+
 async function checkMentions() {
   try {
     log('info', 'Starting mentions check...');
 
-    // Check if we're still in rate limit cooldown
+    // Add minimum time between searches
+    const timeSinceLastSearch = RATE_LIMITS.lastSearchTime 
+      ? Date.now() - RATE_LIMITS.lastSearchTime 
+      : Infinity;
+    
+    if (timeSinceLastSearch < 60000) { // Minimum 60s between searches
+      log('info', 'Too soon to search again', {
+        waitFor: Math.round((60000 - timeSinceLastSearch)/1000) + 's'
+      });
+      return;
+    }
+
+    // Check rate limit cooldown
     if (RATE_LIMITS.resetTime && Date.now() < RATE_LIMITS.resetTime) {
       log('info', 'Waiting for rate limit reset', {
         resetsIn: Math.round((RATE_LIMITS.resetTime - Date.now()) / 1000) + 's'
@@ -86,83 +162,66 @@ async function checkMentions() {
       return;
     }
 
-    // Test Twitter client with a simpler API call first
+    // Skip the test call and go straight to search
     try {
-      const testCall = await userClient.v2.me();
-      log('debug', 'Twitter client test successful', {
-        username: testCall.data.username
-      });
-    } catch (e) {
-      if (e.code === 429) {
-        handleRateLimit(e);
-        return;
-      }
-      throw e;
-    }
-
-    // Try the search with rate limit handling
-    let mentions;
-    try {
-      mentions = await userClient.v2.search('"@GenerateWhop"', {
-        max_results: 10, // Reduced from 25 to help with rate limits
+      const mentions = await userClient.v2.search('"@GenerateWhop"', {
+        max_results: 5, // Reduced further to be extra gentle
         'tweet.fields': ['referenced_tweets', 'author_id', 'text', 'created_at'],
         expansions: ['referenced_tweets.id', 'author_id']
       });
-    } catch (searchError) {
-      if (searchError.code === 429) {
-        handleRateLimit(searchError);
+
+      // Update last search time
+      RATE_LIMITS.lastSearchTime = Date.now();
+
+      if (!mentions?.data?.length) {
+        log('info', 'No mentions found');
         return;
       }
-      log('error', 'Search failed', {
-        error: searchError.message,
-        code: searchError.code
-      });
-      throw searchError;
-    }
 
-    // Validate mentions response
-    log('debug', 'Search response', {
-      hasData: !!mentions?.data,
-      dataLength: mentions?.data?.length,
-      meta: mentions?.meta,
-      errors: mentions?.errors
-    });
+      log('info', `Found ${mentions.data.length} mentions`);
 
-    if (!mentions?.data?.length) {
-      log('info', 'No mentions found');
-      return;
-    }
+      for (const tweet of mentions.data) {
+        try {
+          if (processedTweets.has(tweet.id)) {
+            continue;
+          }
 
-    log('info', `Found ${mentions.data.length} mentions`);
+          log('process', 'Processing tweet', {
+            id: tweet.id,
+            text: tweet.text
+          });
 
-    for (const tweet of mentions.data) {
-      try {
-        if (processedTweets.has(tweet.id)) {
-          continue;
+          const result = await handleWhopGeneration(tweet, false, userClient, log);
+          
+          if (result?.status === 'success') {
+            processedTweets.add(tweet.id);
+          }
+
+        } catch (error) {
+          log('error', 'Error processing tweet', {
+            error: error.message,
+            id: tweet.id
+          });
         }
-
-        log('process', 'Processing tweet', {
-          id: tweet.id,
-          text: tweet.text
-        });
-
-        const result = await handleWhopGeneration(tweet, false, userClient, log);
-        
-        if (result?.status === 'success') {
-          processedTweets.add(tweet.id);
-        }
-
-      } catch (error) {
-        log('error', 'Error processing tweet', {
-          error: error.message,
-          id: tweet.id
-        });
       }
+
+    } catch (error) {
+      if (error.code === 429) {
+        handleRateLimit(error);
+        return;
+      }
+      throw error;
     }
 
   } catch (error) {
+    if (error.code === 429) {
+      handleRateLimit(error);
+      return;
+    }
     log('error', 'Failed to check mentions', {
-      error: error.message
+      error: error.message,
+      code: error.code,
+      rateLimitInfo: error.rateLimit
     });
   } finally {
     const nextCheck = RATE_LIMITS.resetTime 
@@ -174,11 +233,12 @@ async function checkMentions() {
   }
 }
 
-// Add rate limit handling function
+// Update rate limit handler
 function handleRateLimit(error) {
+  // Get reset time from headers if available
   const resetTime = error.rateLimit?.reset 
-    ? error.rateLimit.reset * 1000  // Convert to milliseconds
-    : Date.now() + 900000; // Default to 15 minutes if no reset time
+    ? error.rateLimit.reset * 1000
+    : Date.now() + Math.max(RATE_LIMITS.currentInterval * 2, 300000); // At least 5 minutes
 
   RATE_LIMITS.resetTime = resetTime;
   RATE_LIMITS.currentInterval = Math.min(
@@ -188,25 +248,7 @@ function handleRateLimit(error) {
 
   log('rate-limit', 'Rate limited', {
     resetsAt: new Date(resetTime).toLocaleTimeString(),
-    newInterval: Math.round(RATE_LIMITS.currentInterval / 1000) + 's'
+    newInterval: Math.round(RATE_LIMITS.currentInterval / 1000) + 's',
+    rateLimitInfo: error.rateLimit || 'No rate limit info'
   });
-}
-
-// Start the server and bot
-app.listen(port, async () => {
-  console.log(`Server running at http://localhost:${port}`);
-  
-  try {
-    const me = await userClient.v2.me();
-    log('info', 'Twitter credentials verified', {
-      id: me.data.id,
-      username: me.data.username,
-      name: me.data.name
-    });
-    
-    // Start checking mentions
-    checkMentions();
-  } catch (error) {
-    console.error('Failed to verify Twitter credentials:', error);
-  }
-}); 
+} 
