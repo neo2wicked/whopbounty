@@ -22,11 +22,11 @@ const openai = new OpenAI({
 });
 
 // Oh lord, here we go - the main bot logic that'll probably break
-async function handleWhopGeneration(tweet, testMode = false, twitterClient = null) {
+async function handleWhopGeneration(tweet, testMode = false, twitterClient = null, log) {
   const prompt = tweet.text.replace('@GenerateWhop', '').trim();
   
   try {
-    // Generate store details using GPT-4 because you're too lazy to write proper logic
+    log('process', 'Generating store details with GPT-4...', { tweet: tweet.text });
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
       messages: [{
@@ -39,23 +39,17 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     });
 
     const storeDetails = JSON.parse(completion.choices[0].message.content);
+    log('info', 'Generated store details', { storeDetails });
     
-    // Generate a logo using DALL-E because why not waste more API credits
+    log('process', 'Generating logo with DALL-E...');
     const logoResponse = await openai.images.generate({
       prompt: `Professional minimalist logo for ${storeDetails.name}, business icon`,
       n: 1,
       size: '1024x1024'
     });
+    log('info', 'Generated logo', { url: logoResponse.data[0].url });
 
-    // Add this before the Whop API call
-    console.log('Attempting to create Whop store with:', {
-      name: storeDetails.name,
-      description: storeDetails.description,
-      bold_claim: storeDetails.boldClaim,
-      logo_url: logoResponse.data[0].url
-    });
-
-    // Hit that Whop API like it owes you money
+    log('process', 'Creating Whop store...');
     const whopResponse = await axios.post('https://whop.com/api/onboarding/create-company', {
       name: storeDetails.name,
       description: storeDetails.description,
@@ -85,17 +79,19 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
       }
     });
 
-    // Extract store URL from response or headers
     const storeUrl = whopResponse.headers?.location || 
                     whopResponse.data?.url || 
                     `https://whop.com/${storeDetails.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+    
+    log('success', 'Created Whop store', { url: storeUrl });
 
-    // Only try to reply if not in test mode
-    if (!testMode) {
+    if (!testMode && twitterClient) {
+      log('process', 'Replying to tweet...');
       await twitterClient.v2.reply(
         `✨ Created your Whop store! Check it out: ${storeUrl}`,
         tweet.id
       );
+      log('success', 'Replied to tweet');
     }
 
     return {
@@ -109,20 +105,10 @@ async function handleWhopGeneration(tweet, testMode = false, twitterClient = nul
     };
 
   } catch (error) {
-    // Better error handling
-    console.error('Whop error:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message,
-      headers: error.response?.headers
+    log('error', 'Failed to generate store', {
+      error: error.message,
+      stack: error.stack
     });
-    
-    if (!testMode) {
-      await twitterClient.v2.reply(
-        `😅 Oops! Something went wrong creating your store. Please try again later.`,
-        tweet.id
-      );
-    }
     throw error;
   }
 }
